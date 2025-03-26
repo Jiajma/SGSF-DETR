@@ -1,2 +1,2 @@
 # SGSF-DETR
-print("🚀 This project is coming soon!")
+# 🚀 This project is coming soon
