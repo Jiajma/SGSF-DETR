@@ -1,0 +1,278 @@
+from typing import List, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from mmcv.cnn import ConvModule, build_norm_layer
+from mmengine.model import BaseModule
+from torch import Tensor
+
+from mmdet.registry import MODELS
+from mmdet.utils import ConfigType, MultiConfig, OptConfigType
+
+
+# class ModifiedChannelMapper(BaseModule):
+#     def __init__(self, in_channels, out_channels, kernel_size=3, conv_cfg=None, norm_cfg=None, act_cfg=None, bias='auto', num_outs=4, init_cfg=None):
+#         super().__init__(init_cfg=init_cfg)
+#         assert isinstance(in_channels, list)
+#
+#         # 保存原始输入通道数
+#         self.in_channels = in_channels
+#         self.out_channels = out_channels
+#         self.num_outs = num_outs
+#
+#         # 生成额外的卷积层，用于生成额外的256通道特征图
+#         if num_outs > len(in_channels):
+#             self.extra_conv = ConvModule(
+#                 in_channels[-1],  # 使用最后一个输入特征图生成额外的特征图
+#                 out_channels,
+#                 kernel_size,
+#                 stride=2,
+#                 padding=(kernel_size - 1) // 2,
+#                 conv_cfg=conv_cfg,
+#                 norm_cfg=norm_cfg,
+#                 act_cfg=act_cfg,
+#                 bias=bias
+#             )
+#         else:
+#             self.extra_conv = None
+#
+#     def forward(self, inputs):
+#         # 输入特征图数
+#         assert len(inputs) == len(self.in_channels)
+#
+#         # 生成额外的256通道特征图，并放在开头
+#         if self.extra_conv:
+#             extra_out = self.extra_conv(inputs[-1])
+#             # 将额外生成的特征图与原始特征图结合
+#             processed_inputs = [extra_out] + list(inputs)  # 将元组转换为列表
+#         else:
+#             processed_inputs = list(inputs)  # 将元组转换为列表
+#
+#         return tuple(processed_inputs)  # 转换回元组
+
+
+# 解耦卷积模块
+class DecoupledConvModule(BaseModule):
+    def __init__(self, in_channels, norm_cfg=None):
+        super(DecoupledConvModule, self).__init__()
+        # 深度可分离卷积 (3, 1)
+        self.branch1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        # 深度可分离卷积 (3, 2)
+        self.branch2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=2, dilation=2, groups=in_channels)
+        # 深度可分离卷积 (3, 3)
+        self.branch3 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=3, dilation=3, groups=in_channels)
+        # 深度可分离卷积 (3, 1) + (5, 2)
+        self.branch4_1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        self.branch4_2 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=4, dilation=2, groups=in_channels)
+        # 深度可分离卷积 (5, 1) + (7, 3)
+        self.branch5_1 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2, groups=in_channels)
+        self.branch5_2 = nn.Conv2d(in_channels, in_channels, kernel_size=7, padding=9, dilation=3, groups=in_channels)
+        # Pointwise卷积，用于调整通道数
+        self.pointwise = nn.Conv2d(in_channels * 5, in_channels, kernel_size=1)
+        # 归一化层
+        self.norm = nn.BatchNorm2d(in_channels) if norm_cfg is None else build_norm_layer(norm_cfg, in_channels)[1]
+
+    def forward(self, x):
+        # 分支1: (3, 1)
+        x1 = self.branch1(x)
+        # 分支2: (3, 2)
+        x2 = self.branch2(x)
+        # 分支3: (3, 3)
+        x3 = self.branch3(x)
+        # 分支4: (3, 1) + (5, 2)
+        x4 = self.branch4_1(x)
+        x4 = self.branch4_2(x4)
+        # 分支5: (5, 1) + (7, 3)
+        x5 = self.branch5_1(x)
+        x5 = self.branch5_2(x5)
+        # 合并所有分支
+        x = torch.cat([x1, x2, x3, x4, x5], dim=1)
+        # Pointwise卷积
+        x = self.pointwise(x)
+        # 归一化层
+        x = self.norm(x)
+        return x
+
+
+# 复杂特征融合模块：卷积 + MHSA + SKNet
+class ComplexFeatureFusionModule(BaseModule):
+    def __init__(self, in_channels, norm_cfg=None, num_heads=8, num_layers=2, reduction=16):
+        super(ComplexFeatureFusionModule, self).__init__()
+        # 五个分支卷积
+        self.branch1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        self.branch2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=2, dilation=2, groups=in_channels)
+        self.branch3 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=3, dilation=3, groups=in_channels)
+        self.branch4_1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, groups=in_channels)
+        self.branch4_2 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=4, dilation=2, groups=in_channels)
+        self.branch5_1 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2, groups=in_channels)
+        self.branch5_2 = nn.Conv2d(in_channels, in_channels, kernel_size=7, padding=9, dilation=3, groups=in_channels)
+
+        # Transformer编码器层
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=in_channels, nhead=num_heads, dim_feedforward=in_channels * 4),
+            num_layers=num_layers
+        )
+
+        # 全局平均池化
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+        # 全连接层，用于生成通道注意力
+        self.fc1 = nn.Linear(in_channels, in_channels // reduction, bias=False)
+        self.fc2 = nn.Linear(in_channels // reduction, in_channels * 6, bias=False)
+
+        # softmax层
+        self.softmax = nn.Softmax(dim=1)
+
+        # 归一化层
+        self.norm = nn.BatchNorm2d(in_channels) if norm_cfg is None else build_norm_layer(norm_cfg, in_channels)[1]
+
+    def forward(self, x):
+        # 五个分支卷积
+        x1 = self.branch1(x)
+        x2 = self.branch2(x)
+        x3 = self.branch3(x)
+        x4 = self.branch4_1(x)
+        x4 = self.branch4_2(x4)
+        x5 = self.branch5_1(x)
+        x5 = self.branch5_2(x5)
+
+        # 将输入特征图转换为序列
+        b, c, h, w = x.size()
+        x_seq = rearrange(x, 'b c h w -> (h w) b c')
+
+        # Transformer编码
+        x_seq = self.transformer(x_seq)
+
+        # 将序列转换回特征图
+        x_seq = rearrange(x_seq, '(h w) b c -> b c h w', h=h, w=w)
+
+        # 特征融合
+        feats = torch.stack([x1, x2, x3, x4, x5, x_seq], dim=1)  # [B, 6, C, H, W]
+
+        # 全局平均池化
+        U = x1 + x2 + x3 + x4 + x5 + x_seq
+        s = self.global_pool(U)  # [B, C, 1, 1]
+        s = s.view(s.size(0), -1)  # [B, C]
+
+        # 通过全连接层生成权重
+        z = self.fc1(s)
+        z = nn.ReLU(inplace=False)(z)
+        a_b = self.fc2(z)  # [B, 6*C]
+        a_b = a_b.view(a_b.size(0), 6, -1)  # [B, 6, C]
+
+        # 使用softmax生成权重
+        attention = self.softmax(a_b)  # [B, 6, C]
+
+        # 将生成的值与原先的两个特征图相乘
+        attention = attention.unsqueeze(-1).unsqueeze(-1)  # [B, 6, C, 1, 1]
+        out = (feats * attention).sum(dim=1)  # [B, C, H, W]
+
+        out = self.norm(out)
+        # 将原始特征图与输出特征图作点乘
+        out = out * x
+
+        return out
+
+
+# 自定义FPN
+@MODELS.register_module()
+class L2GFPN(BaseModule):
+    def __init__(self, in_channels, out_channels=256, norm_cfg=None, init_cfg=None):
+        super(L2GFPN, self).__init__(init_cfg=init_cfg)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # # 使用 ModifiedChannelMapper 处理输入特征图
+        # self.channel_mapper = ModifiedChannelMapper(
+        #     in_channels=in_channels,
+        #     out_channels=out_channels,
+        #     kernel_size=1,
+        #     norm_cfg=norm_cfg,
+        #     num_outs=4
+        # )
+
+        # 使用 1x1 卷积处理输入特征图
+        self.one_by_one_conv = nn.ModuleList([
+            ConvModule(c, out_channels, kernel_size=1, norm_cfg=norm_cfg) for c in in_channels
+        ])
+
+        # 解耦卷积模块
+        self.deconv_modules = nn.ModuleList([
+            DecoupledConvModule(out_channels, norm_cfg) for _ in in_channels
+        ])
+
+        # 自顶向下路径
+        self.lateral_convs = nn.ModuleList([
+            ConvModule(out_channels, out_channels, 1, norm_cfg=norm_cfg) for _ in in_channels
+        ])
+        self.fpn_convs = nn.ModuleList(
+            [ConvModule(out_channels, out_channels, 3, padding=1, norm_cfg=norm_cfg) for _ in in_channels]
+        )
+
+        # 每个特征图的复杂特征融合模块（使用修改后的SKNet）
+        self.fusion_modules = nn.ModuleList([
+            ComplexFeatureFusionModule(out_channels, norm_cfg) for _ in in_channels
+        ])
+
+        # 自下向上路径
+        self.bottom_up_convs = nn.ModuleList([
+            ConvModule(out_channels, out_channels, 3, padding=1, norm_cfg=norm_cfg) for _ in in_channels
+        ])
+
+    def forward(self, inputs):
+        # 打印每个输入特征图的维度
+        for i, x in enumerate(inputs):
+            print(f"Input {i} shape: {x.shape}")
+
+        assert len(inputs) == len(self.in_channels)
+
+        # # 通过 ChannelMapper 处理输入特征图
+        # inputs = self.channel_mapper(inputs)
+
+        # 通过 1x1 卷积处理输入特征图
+        inputs = [conv(x) for x, conv in zip(inputs, self.one_by_one_conv)]
+
+        # 打印每个输入特征图的维度
+        for i, x in enumerate(inputs):
+            print(f"Input {i} shape: {x.shape}")
+
+        # 确保 `inputs` 的长度与 `self.deconv_modules` 的长度匹配
+        assert len(inputs) == len(self.deconv_modules)
+
+        # 解耦卷积
+        deconv_features = [deconv(inputs[i]) for i, deconv in enumerate(self.deconv_modules)]
+
+        # 自顶向下路径
+        td_features = [lateral_conv(deconv_features[i]) for i, lateral_conv in enumerate(self.lateral_convs)]
+        for i in range(len(td_features) - 1, 0, -1):
+            upsampled = nn.functional.interpolate(td_features[i], scale_factor=2, mode='nearest')
+            prev_shape = td_features[i - 1].shape[2:]
+            if upsampled.shape[2:] != prev_shape:
+                upsampled = F.interpolate(upsampled, size=prev_shape, mode='nearest')
+            td_features[i - 1] = td_features[i - 1] + upsampled
+
+        td_features = [self.fpn_convs[i](td_features[i]) for i in range(len(td_features))]
+
+        # 复杂特征融合（使用修改后的SKNet）
+        fusion_features = [fusion(td_features[i]) for i, fusion in enumerate(self.fusion_modules)]
+
+        # 自下向上路径
+        bu_features = [fusion_features[0]]
+        for i in range(1, len(fusion_features)):
+            upsampled = nn.functional.interpolate(bu_features[-1], scale_factor=0.5, mode='nearest')
+            if fusion_features[i].size() != upsampled.size():
+                fusion_features[i] = F.interpolate(fusion_features[i], size=upsampled.shape[2:], mode='nearest')
+            bu_features.append(self.bottom_up_convs[i](upsampled + fusion_features[i]))
+
+        return tuple(bu_features)
+
+
+# 在mmdetection配置文件中使用的示例
+neck = dict(
+    type='L2GFPN',
+    in_channels=[256, 512, 1024, 2048],
+    out_channels=256,
+    norm_cfg=dict(type='GN', num_groups=32)
+)
